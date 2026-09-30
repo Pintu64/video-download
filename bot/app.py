@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import shutil
+import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -16,9 +18,17 @@ from bot.services import UPLOAD_LIMIT, ProviderError, card_text, download_item, 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("video-download")
 
-STORE: dict[str, dict] = {}
+STORE: dict[str, tuple[float, dict]] = {}
 BUSY: set[int] = set()
-ROOT = Path(os.environ.get("TEMP", ".")) / "video-download"
+ROOT = Path(tempfile.gettempdir()) / "video-download"
+STORE_TTL_SECONDS = 1800
+
+
+def _purge_store() -> None:
+    now = time.monotonic()
+    expired = [token for token, (created, _) in STORE.items() if now - created > STORE_TTL_SECONDS]
+    for token in expired:
+        STORE.pop(token, None)
 
 
 def _bar(percent: float | None, detail: str) -> str:
@@ -74,6 +84,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    _purge_store()
+
     message = update.message
     urls = [url for url in find_urls(message.text or "") if classify(url)]
     if not urls:
@@ -91,7 +103,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await status.edit_text("That link could not be opened. Try again in a moment.")
             continue
         token = uuid.uuid4().hex[:8]
-        STORE[token] = probe
+        STORE[token] = (time.monotonic(), probe)
         text = card_text(probe)
         markup = _keyboard(token, probe)
         thumb = probe["items"][0].get("thumb")
@@ -152,7 +164,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.message.reply_text("This card expired. Paste the link again.")
         return
     mode_key, token, index_text, *rest = parts
-    probe = STORE[token]
+    entry = STORE.get(token)
+    if entry is None:
+        await query.message.reply_text("This card expired. Paste the link again.")
+        return
+    _, probe = entry
     try:
         item = probe["items"][int(index_text)]
     except (ValueError, IndexError):
@@ -183,6 +199,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await status.edit_text("Ready. The file is in the chat above.", reply_markup=_keyboard(token, probe))
         except Exception:
             pass
+        STORE.pop(token, None)
     except ProviderError as error:
         await query.message.reply_text(str(error)[:500])
     except Exception:
@@ -215,3 +232,4 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_button))
     log.info("bot is running")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
